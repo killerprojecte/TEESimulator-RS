@@ -9,7 +9,6 @@ import android.system.keystore2.Domain
 import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
-import java.security.SecureRandom
 import java.security.cert.Certificate
 import java.util.concurrent.ConcurrentHashMap
 import org.matrix.TEESimulator.attestation.AttestationPatcher
@@ -19,7 +18,6 @@ import org.matrix.TEESimulator.interception.keystore.shim.GeneratedKeyPersistenc
 import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
-import org.matrix.TEESimulator.pki.CertificateGenerator
 import org.matrix.TEESimulator.pki.CertificateHelper
 
 /**
@@ -351,57 +349,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return TransactionResult.SkipTransaction
                     }
 
-                    if (parsedParameters.isAttestKey()) {
-                        SystemLogger.warning(
-                            "[TX_ID: $txId] Found hardware attest key ${keyId.alias} in the reply."
+                    val isHardwareAttestationKey = parsedParameters.isAttestKey()
+                    if (isHardwareAttestationKey) {
+                        SystemLogger.info(
+                            "[TX_ID: $txId] Found hardware attestation key ${keyId.alias}; applying normal certificate post-processing."
                         )
-                        val keyData =
-                            CertificateGenerator.generateAttestedKeyPair(
-                                callingUid,
-                                keyId.alias,
-                                null,
-                                parsedParameters,
-                                response.metadata.keySecurityLevel,
-                            ) ?: throw Exception("Failed to create overriding attest key pair.")
-
-                        CertificateHelper.updateCertificateChain(
-                                response.metadata,
-                                keyData.second.toTypedArray(),
-                            )
-                            .getOrThrow()
-                        response.metadata.authorizations =
-                            InterceptorUtils.patchAuthorizations(
-                                response.metadata.authorizations,
-                                callingUid,
-                            )
-
-                        val newNspace = SecureRandom().nextLong()
-                        response.metadata.key?.let { it.nspace = newNspace }
-                        KeyMintSecurityLevelInterceptor.generatedKeys[keyId] =
-                            KeyMintSecurityLevelInterceptor.GeneratedKeyInfo(
-                                keyData.first,
-                                null,
-                                newNspace,
-                                response,
-                                parsedParameters,
-                            )
-                        KeyMintSecurityLevelInterceptor.attestationKeys.add(keyId)
-
-                        GeneratedKeyPersistence.save(
-                            keyId = keyId,
-                            keyPair = keyData.first,
-                            nspace = newNspace,
-                            securityLevel = response.metadata.keySecurityLevel,
-                            certChain = keyData.second,
-                            algorithm = parsedParameters.algorithm,
-                            keySize = parsedParameters.keySize,
-                            ecCurve = parsedParameters.ecCurve ?: 0,
-                            purposes = parsedParameters.purpose,
-                            digests = parsedParameters.digest,
-                            isAttestationKey = true,
-                        )
-
-                        return InterceptorUtils.createTypedObjectReply(response)
+                        KeyMintSecurityLevelInterceptor.markHardwareAttestationKey(keyId)
                     }
 
                     val originalChain = CertificateHelper.getCertificateChain(response)

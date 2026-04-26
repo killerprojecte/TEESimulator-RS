@@ -209,16 +209,23 @@ class KeyMintSecurityLevelInterceptor(
             val metadata: KeyMetadata =
                 reply.readTypedObject(KeyMetadata.CREATOR)
                     ?: return TransactionResult.SkipTransaction
+            // Read the request parcel to extract keyDescriptor and cert date params.
+            data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+            val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                ?: return TransactionResult.SkipTransaction
+            data.readTypedObject(KeyDescriptor.CREATOR) // skip attestationKey
+            val keyParams = data.createTypedArray(KeyParameter.CREATOR)
+            val parsedKeyParams = keyParams?.let { KeyMintAttestation(it) }
+            val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+
+            val isHardwareAttestationKey = parsedKeyParams?.isAttestKey() == true
+            if (isHardwareAttestationKey) {
+                SystemLogger.debug("Hardware attestation key generated for $keyId; applying normal certificate post-processing.")
+            }
+
             val originalChain =
                 CertificateHelper.getCertificateChain(metadata)
-                    ?: return TransactionResult.SkipTransaction
-            if (originalChain.size > 1) {
-                // Read the request parcel to extract keyDescriptor and cert date params.
-                data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
-                val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-                    ?: return TransactionResult.SkipTransaction
-                data.readTypedObject(KeyDescriptor.CREATOR) // skip attestationKey
-                val keyParams = data.createTypedArray(KeyParameter.CREATOR)
+            if (originalChain != null && originalChain.size > 1) {
                 val certNotBefore = keyParams?.find { it.tag == Tag.CERTIFICATE_NOT_BEFORE }?.value?.dateTime?.let { Date(it) }
                 val certNotAfter = keyParams?.find { it.tag == Tag.CERTIFICATE_NOT_AFTER }?.value?.dateTime?.let { Date(it) }
 
@@ -227,7 +234,6 @@ class KeyMintSecurityLevelInterceptor(
                 // Cache the newly patched chain to ensure consistency across subsequent API calls.
                 val key = metadata.key
                     ?: return TransactionResult.SkipTransaction
-                val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                 CertificateHelper.updateCertificateChain(metadata, newChain).getOrThrow()
                 metadata.authorizations =
                     InterceptorUtils.patchAuthorizations(metadata.authorizations, callingUid)
@@ -239,11 +245,17 @@ class KeyMintSecurityLevelInterceptor(
                     this.metadata = metadata
                     iSecurityLevel = original
                 }
+                if (isHardwareAttestationKey) {
+                    markHardwareAttestationKey(keyId)
+                }
                 SystemLogger.debug(
                     "Cached patched certificate chain for $keyId. (${key.alias} [${key.domain}, ${key.nspace}])"
                 )
 
                 return InterceptorUtils.createTypedObjectReply(metadata)
+            }
+            if (isHardwareAttestationKey) {
+                rememberHardwareAttestationKey(keyId)
             }
         }
         return TransactionResult.SkipTransaction
@@ -483,13 +495,19 @@ class KeyMintSecurityLevelInterceptor(
 
                 val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                 val isAttestKeyRequest = parsedParams.isAttestKey()
+                val usesHardwareAttestationKey = attestationKey != null
+
+                if (isAttestKeyRequest || usesHardwareAttestationKey) {
+                    cleanupKeyData(keyId)
+                    SystemLogger.info(
+                        "[TX_ID: $txId] Forwarding hardware attestation key path for ${keyDescriptor.alias}."
+                    )
+                    return TransactionResult.Continue
+                }
 
                 val forceGenerate =
                     oversized ||
-                        ConfigurationManager.shouldGenerate(callingUid) ||
-                        (ConfigurationManager.shouldPatch(callingUid) && isAttestKeyRequest) ||
-                        (attestationKey != null &&
-                            isAttestationKey(KeyIdentifier(callingUid, attestationKey.alias)))
+                        ConfigurationManager.shouldGenerate(callingUid)
 
                 val isAuto = ConfigurationManager.isAutoMode(callingUid)
 
@@ -522,6 +540,13 @@ class KeyMintSecurityLevelInterceptor(
         keyId: KeyIdentifier,
         isAttestKeyRequest: Boolean,
     ): TransactionResult {
+        if (isAttestKeyRequest || attestationKey != null) {
+            SystemLogger.warning(
+                "Refusing software generation for attestation-key path ${keyDescriptor.alias}; forwarding to hardware."
+            )
+            return TransactionResult.Continue
+        }
+
         val genStartNanos = System.nanoTime()
         keyDescriptor.nspace = secureRandom.nextLong()
         SystemLogger.info("Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}].")
@@ -828,6 +853,13 @@ class KeyMintSecurityLevelInterceptor(
         for (record in records) {
             runCatching {
                 val keyId = KeyIdentifier(record.uid, record.alias)
+                if (record.isAttestationKey) {
+                    SystemLogger.info(
+                        "Discarding persisted software attestation key $keyId; hardware attestation keys are used directly."
+                    )
+                    GeneratedKeyPersistence.delete(keyId)
+                    return@runCatching
+                }
                 if (generatedKeys.containsKey(keyId)) {
                     SystemLogger.debug("Skipping already-loaded key: $keyId")
                     return@runCatching
@@ -991,6 +1023,16 @@ class KeyMintSecurityLevelInterceptor(
         fun getPatchedChain(keyId: KeyIdentifier): Array<Certificate>? = patchedChains[keyId]
 
         fun isAttestationKey(keyId: KeyIdentifier): Boolean = attestationKeys.contains(keyId)
+
+        fun rememberHardwareAttestationKey(keyId: KeyIdentifier) {
+            cleanupKeyData(keyId)
+            markHardwareAttestationKey(keyId)
+        }
+
+        fun markHardwareAttestationKey(keyId: KeyIdentifier) {
+            attestationKeys.add(keyId)
+            SystemLogger.debug("Remembered hardware attestation key $keyId")
+        }
 
         fun cleanupKeyData(keyId: KeyIdentifier) {
             if (generatedKeys.remove(keyId) != null) {
